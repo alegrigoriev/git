@@ -382,23 +382,25 @@ while read commit parents; do
 
 	case "$filter_subdir" in
 	"")
+		tree=$(git rev-parse "$commit^{tree}")
 		if test -n "$need_index"
 		then
-			GIT_ALLOW_NULL_SHA1=1 git read-tree -i -m $commit
+			GIT_ALLOW_NULL_SHA1=1 git read-tree -i -m $tree
 		fi
 		;;
 	*)
-		# The commit may not have the subdirectory at all
-		err=$(GIT_ALLOW_NULL_SHA1=1 \
-		      git read-tree -i -m $commit:"$filter_subdir" 2>&1) || {
-			if ! git rev-parse -q --verify $commit:"$filter_subdir"
-			then
-				rm -f "$GIT_INDEX_FILE"
-			else
-				echo >&2 "$err"
-				false
-			fi
-		}
+		# The commit may not have the subdirectory at all, if the directory was deleted?
+		if tree=$(git rev-parse $commit:"$filter_subdir")
+		then
+			# cat-file returned the string formatted as expected
+			GIT_ALLOW_NULL_SHA1=1 git read-tree -i -m $tree
+		else
+			# The directory was deleted from the history in this commit.
+			git read-tree --empty
+			tree=$(git write-tree) # will produce 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+			# The empty tree will not be saved as a commit by git_commit_non_empty_tree
+			# But we have an opportunity to apply tree-filter or index-filter on it
+		fi
 	esac || die "Could not initialize the index"
 
 	GIT_COMMIT=$commit
@@ -421,7 +423,7 @@ while read commit parents; do
 			die "tree filter failed: $filter_tree"
 
 		(
-			git diff-index -r --name-only --ignore-submodules $commit -- &&
+			git diff-index -r --name-only --ignore-submodules $tree -- &&
 			git ls-files --others
 		) > "$tempdir"/tree-state || exit
 		git update-index --add --replace --remove --stdin \
@@ -463,11 +465,9 @@ while read commit parents; do
 	if test -n "$need_index"
 	then
 		tree=$(git write-tree)
-	else
-		tree=$(git rev-parse "$commit^{tree}")
 	fi
 	workdir=$workdir @SHELL_PATH@ -c "$filter_commit" "git commit-tree" \
-		"$tree" $parentstr < ../message > ../map/$commit ||
+		$tree $parentstr < ../message > ../map/$commit ||
 			die "could not write rewritten commit"
 done <../revs
 
