@@ -363,8 +363,7 @@ then
 fi
 
 if test -n "$filter_index" ||
-   test -n "$filter_tree" ||
-   test -n "$filter_subdir"
+   test -n "$filter_tree"
 then
 	need_index=t
 else
@@ -383,25 +382,23 @@ while read commit parents; do
 	case "$filter_subdir" in
 	"")
 		tree=$(git rev-parse "$commit^{tree}")
-		if test -n "$need_index"
-		then
-			GIT_ALLOW_NULL_SHA1=1 git read-tree -i -m $tree
-		fi
 		;;
 	*)
 		# The commit may not have the subdirectory at all, if the directory was deleted?
-		if tree=$(git rev-parse $commit:"$filter_subdir")
+		if ! tree=$(git rev-parse $commit:"$filter_subdir" 2>/dev/null )
 		then
-			# cat-file returned the string formatted as expected
-			GIT_ALLOW_NULL_SHA1=1 git read-tree -i -m $tree
-		else
 			# The directory was deleted from the history in this commit.
 			git read-tree --empty
 			tree=$(git write-tree) # will produce 4b825dc642cb6eb9a060e54bf8d69288fbee4904
 			# The empty tree will not be saved as a commit by git_commit_non_empty_tree
 			# But we have an opportunity to apply tree-filter or index-filter on it
 		fi
-	esac || die "Could not initialize the index"
+	esac
+
+	if test -n "$need_index"
+	then
+		GIT_ALLOW_NULL_SHA1=1 git read-tree -i -m $tree || die "Could not initialize the index"
+	fi
 
 	GIT_COMMIT=$commit
 	export GIT_COMMIT
