@@ -468,6 +468,9 @@ fi
 
 last_gitattributes_checked_out=$null_tree
 
+# FIXME! nproc may not be available on all platforms. It's available under Windows Bash prompt, though.
+declare -i max_hash_job_num=$(nproc --all)
+
 while read commit parents; do
 	git_filter_branch__commit_count=$(($git_filter_branch__commit_count+1))
 
@@ -601,19 +604,56 @@ while read commit parents; do
 		fi
 
 		git diff-tree -r --no-renames $parent_tree $tree | {
+			declare -a hash_jobs
+			declare -i hash_job_num=0
+			declare -i hash_job_cons=0
+			declare -i hash_job_prod=0
+
 			while read mode1 mode2 obj_id1 obj_id2 operation object_path ; do
 			# Apply these diffs to the index
 
 			if [ $obj_id2 != 0000000000000000000000000000000000000000 ] &&
 			# else hash==00000000... - the entry is being deleted, can't rehash it
 				test -n "$renormalize" && [ $mode2 != 160000 ]
-			then
 				# mode 160000 - a submodule, don't pass through hash-object
+			then
+				if [ $hash_job_prod -ge 128 ]
+				then
+					wait # for all
+					hash_job_cons=0
+					hash_job_prod=0
+					hash_job_num=0
+				elif [ $hash_job_num -ge $max_hash_job_num ]
+				then
+					wait ${hash_jobs[$hash_job_cons]}
+					exit_code=$?
+					if [ $exit_code -gt 0 ] ; then
+						# Note that in Windows the process ID will become invalid if the process completed before 'wait' command
+						# and the command completes with error
+						echo "Hash job index $hash_job_cons ${hash_jobs[$hash_job_cons]} produced exit code $exit_code" >&2
+					fi
+					hash_job_cons+=1
+					hash_job_num=$hash_job_num-1
+				fi
+			(
 				# Symbolic links (mode 120000) will still get passed through hash-object, to
 				# give it an opportunity to substitute a replace ref.
 				obj_id2=$(git cat-file blob $obj_id2 |
 					git hash-object -t blob -w --stdin --path "$object_path" 2>/dev/null )
 				# add this path as a newly normalized blob
+				if [ "$diff_tree_filter" ] && [ "$diff_tree_filter" != cat ]
+				then
+					# re-normalize filter - can modify mode or path, or drop the file altogether!
+					# You can also check if .gitattributes was modified and drop this line
+					echo -e "$mode2 $obj_id2 0\t$object_path" | eval "$diff_tree_filter"
+				else
+					echo -e "$mode2 $obj_id2 0\t$object_path"
+				fi
+			) &
+				hash_jobs[$hash_job_prod]=$!
+				hash_job_prod+=1
+				hash_job_num+=1
+				continue
 			fi
 
 			if [ "$diff_tree_filter" != cat ]
@@ -624,7 +664,18 @@ while read commit parents; do
 			else
 				echo -e "$mode2 $obj_id2 0\t$object_path"
 			fi
-		done | git --no-replace-objects update-index --index-info || die "update-index failed for normalization"
+		done
+		#Make sure any outstanding hash-object operations completed
+		while [ $hash_job_num -ne 0 ] ; do
+			wait ${hash_jobs[$hash_job_cons]}
+			exit_code=$?
+			# Note that in Windows the process ID will become invalid if the process completed before 'wait' command
+			# and the command completes with error
+			if [ $exit_code -gt 0 ] ; then echo "Hash job index $hash_job_cons ${hash_jobs[$hash_job_cons]} produced exit code $exit_code">&2 ; fi
+			hash_job_cons+=1
+			hash_job_num=$hash_job_num-1
+		done
+		} | git --no-replace-objects update-index --index-info || die "update-index failed for normalization"
 		
 		reconstructed_tree=$(git --no-replace-objects write-tree)
 		
