@@ -124,6 +124,7 @@ USAGE="[--setup <command>] [--subdirectory-filter <directory>] [--env-filter <co
 	[--original <namespace>]
 	[-d <directory>] [-f | --force] [--state-branch <branch>]
 	[--index-pre-filter <command>] [--diff-tree-filter <command>]
+	[--renormalize]
 	[--] [<rev-list options>...]"
 
 OPTIONS_SPEC=
@@ -146,6 +147,7 @@ filter_subdir=
 state_branch=
 prefilter_index=
 diff_tree_filter=
+renormalize=
 orig_namespace=refs/original/
 force=
 prune_empty=
@@ -177,6 +179,12 @@ do
 	--filter-gitmodules)
 		shift
 		filter_gitmodules=t
+		continue
+		;;
+	--renormalize)
+		shift
+		renormalize=t
+		remap_to_ancestor=t
 		continue
 		;;
 	-*)
@@ -326,6 +334,11 @@ export GIT_INDEX_FILE
 # map old->new commit ids for rewriting parents
 mkdir ../map || die "Could not create map/ directory"
 
+if test -n "$renormalize" && test -z "$diff_tree_filter"
+then
+	diff_tree_filter=cat
+fi
+
 if test -n "$diff_tree_filter"
 then
 	# map old->new tree ids for reconstricting new tree from diffs
@@ -453,6 +466,8 @@ then
 	null_tree=$(git write-tree)
 fi
 
+last_gitattributes_checked_out=$null_tree
+
 while read commit parents; do
 	git_filter_branch__commit_count=$(($git_filter_branch__commit_count+1))
 
@@ -565,12 +580,49 @@ while read commit parents; do
 		eval "$prefilter_index" < /dev/null ||
 			die "index pre-filter failed: $prefilter_index"
 
+		if test -n "$renormalize"
+		then
+			# During renormalization, hash-object doesn't consider .gitattributes when they're not in the work tree
+			# We need to checkout all changed .gitattributes in the tree, and delete all deleted
+			git diff-index -m --cached --no-renames --ignore-submodules=all --name-status $last_gitattributes_checked_out -- .gitattributes "**/.gitattributes" | \
+				while read operation object_path ; do
+				case $operation in
+					M|A)
+						# checkout the file
+						git checkout-index -q -f -- "$object_path" ;;
+					D)
+						#delete the file
+						rm "$object_path" ;;
+					*)
+					#nothing
+					;;
+				esac
+			done
+		fi
+
 		git diff-tree -r --no-renames $parent_tree $tree | {
 			while read mode1 mode2 obj_id1 obj_id2 operation object_path ; do
+			# Apply these diffs to the index
 
-			# Apply these diffs to the index, after being processed by diff-tree filter
-			# diff-tree filter - can modify mode or path, or drop the file altogether!
-			echo -e "$mode2 $obj_id2 0\t$object_path" | eval "$diff_tree_filter"
+			if [ $obj_id2 != 0000000000000000000000000000000000000000 ] &&
+			# else hash==00000000... - the entry is being deleted, can't rehash it
+				test -n "$renormalize" && [ $mode2 != 160000 ]
+			then
+				# mode 160000 - a submodule, don't pass through hash-object
+				# Symbolic links (mode 120000) will still get passed through hash-object, to
+				# give it an opportunity to substitute a replace ref.
+				obj_id2=$(git cat-file blob $obj_id2 |
+					git hash-object -t blob -w --stdin --path "$object_path" 2>/dev/null )
+				# add this path as a newly normalized blob
+			fi
+
+			if [ "$diff_tree_filter" != cat ]
+			then
+				# diff-tree filter - can modify mode or path, or drop the file altogether!
+				# You can also check if .gitattributes was modified and drop this line
+				echo -e "$mode2 $obj_id2 0\t$object_path" | eval "$diff_tree_filter"
+			else
+				echo -e "$mode2 $obj_id2 0\t$object_path"
 			fi
 		done | git --no-replace-objects update-index --index-info || die "update-index failed for normalization"
 		
@@ -582,6 +634,7 @@ while read commit parents; do
 			echo $reconstructed_tree >../reconstructed_tree_map/$tree
 		fi
 		tree=$reconstructed_tree
+		last_gitattributes_checked_out=$tree
 		#don't need to read the tree anymore
 	elif [ "$need_index" ]
 	then
@@ -612,6 +665,12 @@ while read commit parents; do
 		) > "$tempdir"/tree-state || exit
 		git update-index --add --replace --remove --stdin \
 			< "$tempdir"/tree-state || exit
+
+		if test -n "$renormalize_filter"
+		then
+			# The working tree changed, we need to save it now, to check out .gitattributes on the next turn
+			last_gitattributes_checked_out=$(git write-tree)
+		fi
 	fi
 
 	eval "$filter_index" < /dev/null ||
