@@ -112,6 +112,7 @@ state_branch=
 orig_namespace=refs/original/
 force=
 prune_empty=
+filter_gitmodules=
 remap_to_ancestor=
 while :
 do
@@ -134,6 +135,11 @@ do
 	--prune-empty)
 		shift
 		prune_empty=t
+		continue
+		;;
+	--filter-gitmodules)
+		shift
+		filter_gitmodules=t
 		continue
 		;;
 	-*)
@@ -363,7 +369,8 @@ then
 fi
 
 if test -n "$filter_index" ||
-   test -n "$filter_tree"
+   test -n "$filter_tree" ||
+   { test -n "$filter_subdir" && test -n "$filter_gitmodules"; }
 then
 	need_index=t
 else
@@ -372,6 +379,9 @@ fi
 
 eval "$filter_setup" < /dev/null ||
 	die "filter setup failed: $filter_setup"
+
+last_gitmodules=
+current_gitmodules_adjusted=
 
 while read commit parents; do
 	git_filter_branch__commit_count=$(($git_filter_branch__commit_count+1))
@@ -385,19 +395,58 @@ while read commit parents; do
 		;;
 	*)
 		# The commit may not have the subdirectory at all, if the directory was deleted?
-		if ! tree=$(git rev-parse $commit:"$filter_subdir" 2>/dev/null )
+		if tree=$(git rev-parse $commit:"$filter_subdir" 2>/dev/null )
 		then
+			if test -n "$filter_gitmodules" && current_gitmodules=$(git rev-parse $commit:.gitmodules 2>/dev/null )
+			then
+				if [ "$current_gitmodules" != "$last_gitmodules" ]
+				then
+					# Build new .gitmodules file, with the paths adjusted to the new directory,
+					# and remove those with paths outside the filtered directory
+					git show $commit:.gitmodules >|../.gitmodules
+
+					git config --file ../.gitmodules --list | {
+						submodule_keys=
+						while read name value; do
+							if [[ "$name" = submodule.*.path ]]
+							then
+								submodule_keys+=" $name"
+							fi
+						done
+						for path_key in $submodule_keys ; do
+							submodule_path=$(git config --file ../.gitmodules --get $path_key)
+							if [ "${submodule_path#$filter_subdir/}" = "$submodule_path" ]
+							then
+								# The path is outside of the filtered directory
+								git config --file ../.gitmodules --remove-section ${path_key%.path}
+							else
+								git config --file ../.gitmodules $path_key "${submodule_path#$filter_subdir/}"
+							fi
+						done
+					}
+					current_gitmodules_adjusted=$(git hash-object -t blob -w --path=.gitmodules -- ../.gitmodules )
+					last_gitmodules=$current_gitmodules
+				fi
+			else
+			# No .gitmodules in the original commit
+			last_gitmodules=
+			current_gitmodules_adjusted=
+			fi
+		else
 			# The directory was deleted from the history in this commit.
 			git read-tree --empty
 			tree=$(git write-tree) # will produce 4b825dc642cb6eb9a060e54bf8d69288fbee4904
 			# The empty tree will not be saved as a commit by git_commit_non_empty_tree
 			# But we have an opportunity to apply tree-filter or index-filter on it
+			last_gitmodules=
+			current_gitmodules_adjusted=
 		fi
 	esac
 
 	if test -n "$need_index"
 	then
 		GIT_ALLOW_NULL_SHA1=1 git read-tree -i -m $tree || die "Could not initialize the index"
+		if test -n "$current_gitmodules_adjusted" ;then git update-index --cacheinfo 100644,$current_gitmodules_adjusted,.gitmodules ;fi
 	fi
 
 	GIT_COMMIT=$commit
