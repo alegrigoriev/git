@@ -98,8 +98,16 @@ save_filter_branch_state () {
 				print H "$_:$f\n" or die;
 			}
 			close(H) or die;' || die "Unable to save state")
-	state_tree=$(printf '100644 blob %s\tfilter.map\n' "$state_blob" | git mktree)
-
+	# If the trees are being reconstructed, save the reconstructed tree map, as well
+	if test -n "$3"
+	then
+		reconstructed_tree_blob=$(ls -1 ../reconstructed_tree_map | while read old_tree ; do
+		echo "$old_tree:$(<../reconstructed_tree_map/$old_tree)"; done | git hash-object -w --stdin )
+		state_tree=$(echo "100644 blob $state_blob	filter.map
+100644 blob $reconstructed_tree_blob	reconstructed_tree.map" | git mktree)
+	else
+		state_tree=$(printf '100644 blob %s\tfilter.map\n' "$state_blob" | git mktree)
+	fi
 	if test -n "$state_commit"
 	then
 		state_commit=$(echo "Sync" | git commit-tree "$state_tree" -p "$state_commit")
@@ -115,6 +123,7 @@ USAGE="[--setup <command>] [--subdirectory-filter <directory>] [--env-filter <co
 	[--commit-filter <command>] [--tag-name-filter <command>]
 	[--original <namespace>]
 	[-d <directory>] [-f | --force] [--state-branch <branch>]
+	[--index-pre-filter <command>] [--diff-tree-filter <command>]
 	[--] [<rev-list options>...]"
 
 OPTIONS_SPEC=
@@ -135,6 +144,8 @@ filter_commit=
 filter_tag_name=
 filter_subdir=
 state_branch=
+prefilter_index=
+diff_tree_filter=
 orig_namespace=refs/original/
 force=
 prune_empty=
@@ -218,6 +229,14 @@ do
 		;;
 	--state-branch)
 		state_branch="$OPTARG"
+		;;
+	--index-pre-filter)
+		prefilter_index="$OPTARG"
+		remap_to_ancestor=t
+		;;
+	--diff-tree-filter)
+		diff_tree_filter="$OPTARG"
+		remap_to_ancestor=t
 		;;
 	*)
 		usage
@@ -307,6 +326,12 @@ export GIT_INDEX_FILE
 # map old->new commit ids for rewriting parents
 mkdir ../map || die "Could not create map/ directory"
 
+if test -n "$diff_tree_filter"
+then
+	# map old->new tree ids for reconstricting new tree from diffs
+	mkdir ../reconstructed_tree_map || die "Could not create map/ directory"
+fi
+
 if test -n "$state_branch"
 then
 	state_commit=$(git rev-parse --no-flags --revs-only "$state_branch")
@@ -322,11 +347,18 @@ then
 			}
 			close(MAP) or die;' "$state_commit" \
 				|| die "Unable to load state from $state_branch:filter.map"
+		if test -n "$diff_tree_filter"
+		then
+			# restore old->new tree mappings for reconstricting new tree from diffs
+			git show $state_commit:reconstructed_tree.map | while IFS=':' read old_tree new_tree; do
+				echo $new_tree >../reconstructed_tree_map/$old_tree
+			done
+		fi
 	else
 		echo "Branch $state_branch does not exist. Will create" 1>&2
 	fi
 	# On the script abort, save the state to state-branch blob, delete temp directories
-	trap "save_filter_branch_state $state_branch \"$state_commit\"
+	trap "save_filter_branch_state $state_branch \"$state_commit\" ${diff_tree_filter:+t}
 		cd \"$orig_dir\"; rm -rf \"$tempdir\"" 0
 fi
 
@@ -398,6 +430,7 @@ then
 fi
 
 if test -n "$filter_index" ||
+   test -n "$prefilter_index" ||
    test -n "$filter_tree" ||
    { test -n "$filter_subdir" && test -n "$filter_gitmodules"; }
 then
@@ -411,6 +444,14 @@ eval "$filter_setup" < /dev/null ||
 
 last_gitmodules=
 current_gitmodules_adjusted=
+
+if test -n "$diff_tree_filter" ||
+	test -n "$filter_subdir"
+then
+	# Make sure we have a NULL tree object available
+	git read-tree --empty
+	null_tree=$(git write-tree)
+fi
 
 while read commit parents; do
 	git_filter_branch__commit_count=$(($git_filter_branch__commit_count+1))
@@ -463,20 +504,13 @@ while read commit parents; do
 			fi
 		else
 			# The directory was deleted from the history in this commit.
-			git read-tree --empty
-			tree=$(git write-tree) # will produce 4b825dc642cb6eb9a060e54bf8d69288fbee4904
 			# The empty tree will not be saved as a commit by git_commit_non_empty_tree
 			# But we have an opportunity to apply tree-filter or index-filter on it
+			tree=$null_tree
 			last_gitmodules=
 			current_gitmodules_adjusted=
 		fi
 	esac
-
-	if test -n "$need_index"
-	then
-		GIT_ALLOW_NULL_SHA1=1 git read-tree -i -m $tree || die "Could not initialize the index"
-		if test -n "$current_gitmodules_adjusted" ;then git update-index --cacheinfo 100644,$current_gitmodules_adjusted,.gitmodules ;fi
-	fi
 
 	GIT_COMMIT=$commit
 	export GIT_COMMIT
@@ -487,6 +521,81 @@ while read commit parents; do
 		die "setting author/committer failed for commit $commit"
 	eval "$filter_env" < /dev/null ||
 		die "env filter failed: $filter_env"
+
+	if [ "$diff_tree_filter" ]
+	then
+		# diff the tree from its parent trees. Whichever files change (or added) we add to the index.
+		# In other words, we manually recreate the new index from the new commit parent and difference in the trees
+		# 
+		# Thus, in case the operation doesn't start from the null parent, it's compared against null tree.
+		# Because tree-filter and index-(post)filter can change the trees, we keep a separate map for them
+
+		parent_tree=$null_tree
+		for parent in $parents; do
+			if [ "$filter_subdir" ]
+			then
+				if ! parent_tree=$(git rev-parse $parent:"$filter_subdir" 2>/dev/null )
+					then parent_tree=$null_tree; fi
+			else
+				parent_tree=$(git rev-parse "$parent^{tree}")
+			fi
+			#only the first parent used
+			break
+		done
+
+		# The new tree will be built off the first reconstructed parent, and the tree diff
+		# get reconstructed parent trees from norm_map
+		if test -r "../reconstructed_tree_map/$parent_tree"
+		then
+			reconstructed_parent=$(cat <"../reconstructed_tree_map/$parent_tree" )
+		else
+			# Reconstructed parent tree for this commit doesn't exist.
+			# This means the tree has to be rebuilt fully.
+			# To do that, we use a NULL tree for comparison
+			parent_tree=$null_tree
+			reconstructed_parent=$null_tree
+		fi
+
+		git --no-replace-objects read-tree -i -m $reconstructed_parent ||
+			die "Could not initialize the index"
+
+		if test -n "$current_gitmodules_adjusted" ;then git update-index --cacheinfo 100644,$current_gitmodules_adjusted,.gitmodules ;fi
+
+		# index-pre-filter can add or replace .gitattributes, or add other files.
+		eval "$prefilter_index" < /dev/null ||
+			die "index pre-filter failed: $prefilter_index"
+
+		git diff-tree -r --no-renames $parent_tree $tree | {
+			while read mode1 mode2 obj_id1 obj_id2 operation object_path ; do
+
+			# Apply these diffs to the index, after being processed by diff-tree filter
+			# diff-tree filter - can modify mode or path, or drop the file altogether!
+			echo -e "$mode2 $obj_id2 0\t$object_path" | eval "$diff_tree_filter"
+			fi
+		done | git --no-replace-objects update-index --index-info || die "update-index failed for normalization"
+		
+		reconstructed_tree=$(git --no-replace-objects write-tree)
+		
+		if [ $tree != $null_tree ]
+		then
+			#update the reconstructed tree map
+			echo $reconstructed_tree >../reconstructed_tree_map/$tree
+		fi
+		tree=$reconstructed_tree
+		#don't need to read the tree anymore
+	elif [ "$need_index" ]
+	then
+		git read-tree -i -m $tree || die "Could not initialize the index"
+		if test -n "$current_gitmodules_adjusted" ;then git update-index --cacheinfo 100644,$current_gitmodules_adjusted,.gitmodules ;fi
+
+		# index_pre_filter can add or replace .gitattributes, or add other files.
+		if test -n "$prefilter_index"
+		then 
+			eval "$prefilter_index" < /dev/null ||
+				die "index pre-filter failed: $prefilter_index"
+			tree=$(git write-tree)
+		fi
+	fi
 
 	if [ "$filter_tree" ]; then
 		git checkout-index -f -u -a ||
@@ -712,7 +821,7 @@ trap - 0
 
 if test -n "$state_branch"
 then
-	save_filter_branch_state $state_branch "$state_commit"
+	save_filter_branch_state $state_branch "$state_commit" ${diff_tree_filter:+t}
 fi
 
 cd "$orig_dir"
