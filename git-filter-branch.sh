@@ -83,6 +83,32 @@ set_ident () {
 	finish_ident COMMITTER
 }
 
+# Call this in the trap to save the state to state-branch blob, delete temp directories
+save_filter_branch_state () {
+	local state_branch=$1
+	local state_commit=$2
+	echo "Saving rewrite state to $state_branch" 1>&2
+	state_blob=$(
+		perl -e'opendir D, "../map" or die;
+			open H, "|-", "git hash-object -w --stdin" or die;
+			foreach (sort readdir(D)) {
+				next if m/^\.\.?$/;
+				open F, "<../map/$_" or die;
+				chomp($f = <F>);
+				print H "$_:$f\n" or die;
+			}
+			close(H) or die;' || die "Unable to save state")
+	state_tree=$(printf '100644 blob %s\tfilter.map\n' "$state_blob" | git mktree)
+
+	if test -n "$state_commit"
+	then
+		state_commit=$(echo "Sync" | git commit-tree "$state_tree" -p "$state_commit")
+	else
+		state_commit=$(echo "Sync" | git commit-tree "$state_tree" )
+	fi
+	git update-ref "$state_branch" "$state_commit"
+}
+
 USAGE="[--setup <command>] [--subdirectory-filter <directory>] [--env-filter <command>]
 	[--tree-filter <command>] [--index-filter <command>]
 	[--parent-filter <command>] [--msg-filter <command>]
@@ -299,6 +325,9 @@ then
 	else
 		echo "Branch $state_branch does not exist. Will create" 1>&2
 	fi
+	# On the script abort, save the state to state-branch blob, delete temp directories
+	trap "save_filter_branch_state $state_branch \"$state_commit\"
+		cd \"$orig_dir\"; rm -rf \"$tempdir\"" 0
 fi
 
 # we need "--" only if there are no path arguments in $@
@@ -679,33 +708,15 @@ test -z "$ORIG_GIT_COMMITTER_DATE" || {
 	export GIT_COMMITTER_DATE
 }
 
+trap - 0
+
 if test -n "$state_branch"
 then
-	echo "Saving rewrite state to $state_branch" 1>&2
-	state_blob=$(
-		perl -e'opendir D, "../map" or die;
-			open H, "|-", "git hash-object -w --stdin" or die;
-			foreach (sort readdir(D)) {
-				next if m/^\.\.?$/;
-				open F, "<../map/$_" or die;
-				chomp($f = <F>);
-				print H "$_:$f\n" or die;
-			}
-			close(H) or die;' || die "Unable to save state")
-	state_tree=$(printf '100644 blob %s\tfilter.map\n' "$state_blob" | git mktree)
-	if test -n "$state_commit"
-	then
-		state_commit=$(echo "Sync" | git commit-tree "$state_tree" -p "$state_commit")
-	else
-		state_commit=$(echo "Sync" | git commit-tree "$state_tree" )
-	fi
-	git update-ref "$state_branch" "$state_commit"
+	save_filter_branch_state $state_branch "$state_commit"
 fi
 
 cd "$orig_dir"
 rm -rf "$tempdir"
-
-trap - 0
 
 if [ "$(is_bare_repository)" = false ]; then
 	git read-tree -u -m HEAD || exit
