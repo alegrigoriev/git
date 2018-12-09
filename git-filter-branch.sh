@@ -121,7 +121,7 @@ USAGE="[--setup <command>] [--subdirectory-filter <directory>] [--env-filter <co
 	[--tree-filter <command>] [--index-filter <command>]
 	[--parent-filter <command>] [--msg-filter <command>]
 	[--commit-filter <command>] [--tag-name-filter <command>]
-	[--original <namespace>]
+	[--original <namespace> | --filtered <namespace>]
 	[-d <directory>] [-f | --force] [--state-branch <branch>]
 	[--index-pre-filter <command>] [--diff-tree-filter <command>]
 	[--renormalize]
@@ -149,6 +149,7 @@ prefilter_index=
 diff_tree_filter=
 renormalize=
 orig_namespace=refs/original/
+filtered_namespace=
 force=
 prune_empty=
 filter_gitmodules=
@@ -234,6 +235,13 @@ do
 		;;
 	--original)
 		orig_namespace=$(expr "$OPTARG/" : '\(.*[^/]\)/*$')/
+		# Make sure it starts with refs/
+		if [[ $orig_namespace != refs/* ]]; then orig_namespace=refs/$orig_namespace; fi
+		;;
+	--filtered)
+		filtered_namespace=$(expr "$OPTARG/" : '\(.*[^/]\)/*$')/
+		# Make sure it starts with refs/
+		if [[ $filtered_namespace != refs/* ]]; then filtered_namespace=refs/$filtered_namespace; fi
 		;;
 	--state-branch)
 		state_branch="$OPTARG"
@@ -294,21 +302,26 @@ ORIG_GIT_COMMITTER_DATE="$GIT_COMMITTER_DATE"
 GIT_WORK_TREE=.
 export GIT_DIR GIT_WORK_TREE
 
+if test -n "$filtered_namespace"; then orig_namespace= ; fi
+
 # Make sure refs/original is empty
-git for-each-ref > "$tempdir"/backup-refs || exit
-while read sha1 type name
-do
-	case "$force,$name" in
-	,$orig_namespace*)
-		die "Cannot create a new backup.
-A previous backup already exists in $orig_namespace
-Force overwriting the backup with -f"
-	;;
-	t,$orig_namespace*)
-		git update-ref -d "$name" $sha1
-	;;
-	esac
-done < "$tempdir"/backup-refs
+if test -n "$orig_namespace"
+then
+	git for-each-ref > "$tempdir"/backup-refs || exit
+	while read sha1 type name
+	do
+		case "$force,$name" in
+		,$orig_namespace*)
+			die "Cannot create a new backup.
+	A previous backup already exists in $orig_namespace
+	Force overwriting the backup with -f"
+		;;
+		t,$orig_namespace*)
+			git update-ref -d "$name" $sha1
+		;;
+		esac
+	done < "$tempdir"/backup-refs
+fi
 
 # The refs should be updated if their heads were rewritten
 git rev-parse --no-flags --revs-only --symbolic-full-name \
@@ -789,26 +802,38 @@ _x40="$_x40$_x40$_x40$_x40$_x40$_x40$_x40$_x40"
 echo
 while read ref
 do
-	# avoid rewriting a ref twice
-	test -f "$orig_namespace${ref#refs/}" && continue
+	if test -n "$orig_namespace"
+	then
+		# avoid rewriting a ref twice
+		test -f "$orig_namespace${ref#refs/}" && continue
+	fi
 
 	sha1=$(git rev-parse "$ref"^0)
 	rewritten=$(map $sha1)
 
-	test $sha1 = "$rewritten" &&
-		warn "WARNING: Ref '$ref' is unchanged" &&
-		continue
+	if test -n "$filtered_namespace"
+	then
+		# Don't make update-ref verify previous sha1
+		sha1=
+	else
+		test $sha1 = "$rewritten" &&
+			warn "WARNING: Ref '$ref' is unchanged" &&
+			continue
+	fi
 
 	case "$rewritten" in
 	'')
-		echo "Ref '$ref' was deleted"
-		git update-ref -m "filter-branch: delete" -d "$ref" $sha1 ||
-			die "Could not delete $ref"
+		if test -z "$filtered_namespace"
+		then
+			echo "Ref '$ref' was deleted"
+			git update-ref -m "filter-branch: delete" -d "$ref" $sha1 ||
+				die "Could not delete $ref"
+		fi
 	;;
 	$_x40)
 		echo "Ref '$ref' was rewritten"
 		if ! git update-ref -m "filter-branch: rewrite" \
-					"$ref" $rewritten $sha1 2>/dev/null; then
+					"${filtered_namespace:-refs/}${ref#refs/}" $rewritten $sha1 2>/dev/null; then
 			if test $(git cat-file -t "$ref") = tag; then
 				if test -z "$filter_tag_name"; then
 					warn "WARNING: You said to rewrite tagged commits, but not the corresponding tag."
@@ -826,12 +851,15 @@ do
 		warn "WARNING: Ref '$ref' points to the first one now."
 		rewritten=$(echo "$rewritten" | head -n 1)
 		git update-ref -m "filter-branch: rewrite to first" \
-				"$ref" $rewritten $sha1 ||
+				"${filtered_namespace:-refs/}${ref#refs/}" $rewritten $sha1 ||
 			die "Could not rewrite $ref"
 	;;
 	esac
-	git update-ref -m "filter-branch: backup" "$orig_namespace${ref#refs/}" $sha1 ||
+	if test -n "$orig_namespace"
+	then
+		git update-ref -m "filter-branch: backup" "$orig_namespace${ref#refs/}" $sha1 ||
 		 exit
+	fi
 done < "$tempdir"/heads
 
 # TODO: This should possibly go, with the semantics that all positive given
@@ -883,7 +911,7 @@ if [ "$filter_tag_name" ]; then
 			fi
 		fi
 
-		git update-ref "refs/tags/$new_ref" "$new_sha1" ||
+		git update-ref "${filtered_namespace:-refs/}tags/$new_ref" "$new_sha1" ||
 			die "Could not write tag $new_ref"
 	done
 fi
