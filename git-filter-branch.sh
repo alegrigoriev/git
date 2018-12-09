@@ -148,12 +148,14 @@ state_branch=
 prefilter_index=
 diff_tree_filter=
 renormalize=
+notes_filter=
 orig_namespace=refs/original/
 filtered_namespace=
 force=
 prune_empty=
 filter_gitmodules=
 remap_to_ancestor=
+declare -a exclude_notes
 while :
 do
 	case "$1" in
@@ -254,11 +256,19 @@ do
 		diff_tree_filter="$OPTARG"
 		remap_to_ancestor=t
 		;;
+	--notes-filter)
+		notes_filter="$OPTARG"
+		exclude_notes[0]="--exclude=refs/notes/*"
+		;;
 	*)
 		usage
 		;;
 	esac
 done
+
+if test -n "$notes_filter" &&
+	test -z "$state_branch"
+	then state_branch=rewrite_state_for_notes; fi
 
 case "$prune_empty,$filter_commit" in
 ,)
@@ -411,7 +421,7 @@ case "$filter_subdir" in
 esac
 
 git rev-list --reverse --topo-order --default HEAD \
-	--parents --simplify-merges --stdin "$@" <../parse >../revs ||
+	--parents --simplify-merges --stdin "${exclude_notes[@]}" "$@" <../parse >../revs ||
 	die "Could not get the commits"
 commits=$(wc -l <../revs | tr -d " ")
 
@@ -964,6 +974,21 @@ fi
 
 cd "$orig_dir"
 rm -rf "$tempdir"
+
+if test -n "$notes_filter"
+then
+	git filter-branch --diff-tree-filter '
+		read mode sha1 stage path_name
+		commit_sha1=${path_name/\//}
+		new_commit_sha1=$(map $commit_sha1)
+		path_name=${new_commit_sha1:0:2}/${new_commit_sha1:2}
+		if [ "$commit_sha1" != "$new_commit_sha1" ] && [ $mode != 000000 ] && [ "$notes_filter" != cat ]
+			then sha1=$(git cat-file blob $sha1 | eval "$notes_filter" | git hash-object -w --stdin)
+		fi
+		echo -e "$mode $sha1 $stage\t$path_name"
+		' \
+		--state-branch "$state_branch" ${orig_namespace:+ --original refs/original_notes} ${filtered_namespace:+ --filtered ${filtered_namespace%/}} -- "--glob=refs/notes/*"
+fi
 
 if [ "$(is_bare_repository)" = false ]; then
 	git read-tree -u -m HEAD || exit
