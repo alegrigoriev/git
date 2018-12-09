@@ -496,7 +496,7 @@ echo
 while read ref
 do
 	# avoid rewriting a ref twice
-	test -f "$orig_namespace$ref" && continue
+	test -f "$orig_namespace${ref#refs/}" && continue
 
 	sha1=$(git rev-parse "$ref"^0)
 	rewritten=$(map $sha1)
@@ -536,7 +536,7 @@ do
 			die "Could not rewrite $ref"
 	;;
 	esac
-	git update-ref -m "filter-branch: backup" "$orig_namespace$ref" $sha1 ||
+	git update-ref -m "filter-branch: backup" "$orig_namespace${ref#refs/}" $sha1 ||
 		 exit
 done < "$tempdir"/heads
 
