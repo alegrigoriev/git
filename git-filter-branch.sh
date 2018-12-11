@@ -327,26 +327,32 @@ test $commits -eq 0 && die_with_status 2 "Found nothing to rewrite"
 # Rewrite the commits
 report_progress ()
 {
+	local count effective_count now elapsed remaining
+	count=$git_filter_branch__commit_count
+	effective_count=$(($count - $git_filter_branch__skipped_commits))
+
 	if test -n "$progress" &&
-		test $git_filter_branch__commit_count -gt $next_sample_at
+		test $count -gt $next_sample_at
 	then
-		count=$git_filter_branch__commit_count
 
 		now=$(date +%s)
 		elapsed=$(($now - $start_timestamp))
-		remaining=$(( ($commits - $count) * $elapsed / $count ))
-		if test $elapsed -gt 0
+		if test $elapsed -gt 5 && test $effective_count -gt 0
 		then
-			next_sample_at=$(( ($elapsed + 1) * $count / $elapsed ))
+			next_sample_at=$(( ($elapsed + 1) * $effective_count / $elapsed ))
+			remaining=$(( ($commits - $count) * $elapsed / $effective_count ))
+			progress=" ($elapsed seconds passed, remaining $remaining predicted)"
 		else
 			next_sample_at=$(($next_sample_at + 1))
+			progress=" ($elapsed seconds passed)"
 		fi
-		progress=" ($elapsed seconds passed, remaining $remaining predicted)"
 	fi
 	printf "\rRewrite $commit ($count/$commits)$progress    "
 }
 
 git_filter_branch__commit_count=0
+# Number of commits skipped because they've been processed in previous invocation of filter-branch
+git_filter_branch__skipped_commits=0
 
 progress= start_timestamp=
 if date '+%s' 2>/dev/null | grep -q '^[0-9][0-9]*$'
@@ -371,8 +377,8 @@ eval "$filter_setup" < /dev/null ||
 while read commit parents; do
 	git_filter_branch__commit_count=$(($git_filter_branch__commit_count+1))
 
+	test -f "$workdir"/../map/$commit && git_filter_branch__skipped_commits=$(($git_filter_branch__skipped_commits+1)) continue
 	report_progress
-	test -f "$workdir"/../map/$commit && continue
 
 	case "$filter_subdir" in
 	"")
